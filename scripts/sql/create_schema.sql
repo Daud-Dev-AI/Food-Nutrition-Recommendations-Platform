@@ -1,6 +1,16 @@
 DROP TABLE IF EXISTS fact_food_recommendation;
 DROP TABLE IF EXISTS dim_food;
 DROP TABLE IF EXISTS dim_user_profile;
+DROP TABLE IF EXISTS stg_user_profile_event;
+
+CREATE TABLE stg_user_profile_event (
+    event_id SERIAL PRIMARY KEY,
+    user_id VARCHAR(50) NOT NULL,
+    height_cm NUMERIC(10,2) NOT NULL,
+    current_weight_lb NUMERIC(10,2) NOT NULL,
+    target_weight_lb NUMERIC(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 CREATE TABLE dim_user_profile (
     user_profile_key SERIAL PRIMARY KEY,
