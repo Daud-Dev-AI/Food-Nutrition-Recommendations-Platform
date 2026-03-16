@@ -1,67 +1,81 @@
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 from sqlalchemy import create_engine, text
 import pandas as pd
 
-POSTGRES_URL = "postgresql+psycopg2://de_user:de_pass@localhost:5432/nutrition_dw"
+from app.config import DATABASE_URL
+from app.logger import get_logger
 
-engine = create_engine(POSTGRES_URL)
+logger = get_logger("load_gold_to_postgres")
 
-food_df = pd.read_parquet("data/silver/food_nutrition_clean")
-user_df = pd.read_parquet("data/gold/user_profiles_enriched")
-rec_df = pd.read_parquet("data/gold/food_recommendations")
+engine = create_engine(DATABASE_URL)
 
-# Keep only columns needed for warehouse tables
-dim_food = food_df[
-    [
-        "food_name",
-        "serving_description",
-        "serving_size_value",
-        "calories_kcal",
-        "protein_g",
-        "carbohydrates_g",
-        "fat_g",
-        "fiber_g",
-        "sugar_g",
-        "sodium_mg",
-        "calorie_band",
-        "protein_band",
-        "carb_band",
-        "fat_band",
-        "is_high_protein_low_calorie",
-        "is_high_fiber",
-        "is_low_sugar"
-    ]
-].copy()
+BASE_PATH = os.environ.get("DATA_BASE_PATH", "data")
 
-dim_user = user_df[
-    [
-        "user_id",
-        "height_cm",
-        "current_weight_lb",
-        "target_weight_lb",
-        "goal_type"
-    ]
-].copy()
+logger.info("Reading parquet layers from %s", BASE_PATH)
 
-fact_rec = rec_df[
-    [
-        "user_id",
-        "food_name",
-        "goal_type",
-        "recommendation_score",
-        "recommendation_rank",
-        "recommendation_reason"
-    ]
-].copy()
+food_df = pd.read_parquet(os.path.join(BASE_PATH, "silver", "food_nutrition_clean"))
+user_df = pd.read_parquet(os.path.join(BASE_PATH, "gold", "user_profiles_enriched"))
+rec_df = pd.read_parquet(os.path.join(BASE_PATH, "gold", "food_recommendations"))
 
+logger.info(
+    "Loaded parquets — food=%d rows, users=%d rows, recommendations=%d rows",
+    len(food_df), len(user_df), len(rec_df),
+)
+
+dim_food = food_df[[
+    "food_name",
+    "serving_description",
+    "serving_size_value",
+    "calories_kcal",
+    "protein_g",
+    "carbohydrates_g",
+    "fat_g",
+    "fiber_g",
+    "sugar_g",
+    "sodium_mg",
+    "calorie_band",
+    "protein_band",
+    "carb_band",
+    "fat_band",
+    "is_high_protein_low_calorie",
+    "is_high_fiber",
+    "is_low_sugar",
+]].copy()
+
+dim_user = user_df[[
+    "user_id",
+    "height_cm",
+    "current_weight_lb",
+    "target_weight_lb",
+    "goal_type",
+]].copy()
+
+fact_rec = rec_df[[
+    "user_id",
+    "food_name",
+    "goal_type",
+    "recommendation_score",
+    "recommendation_rank",
+    "recommendation_reason",
+]].copy()
+
+logger.info("Truncating warehouse tables")
 with engine.begin() as conn:
     conn.execute(text("TRUNCATE TABLE fact_food_recommendation RESTART IDENTITY;"))
     conn.execute(text("TRUNCATE TABLE dim_food RESTART IDENTITY;"))
     conn.execute(text("TRUNCATE TABLE dim_user_profile RESTART IDENTITY;"))
 
 dim_user.to_sql("dim_user_profile", engine, if_exists="append", index=False)
-dim_food.to_sql("dim_food", engine, if_exists="append", index=False)
-fact_rec.to_sql("fact_food_recommendation", engine, if_exists="append", index=False)
+logger.info("Loaded dim_user_profile: %d rows", len(dim_user))
 
-print("Loaded dim_user_profile:", len(dim_user))
-print("Loaded dim_food:", len(dim_food))
-print("Loaded fact_food_recommendation:", len(fact_rec))
+dim_food.to_sql("dim_food", engine, if_exists="append", index=False)
+logger.info("Loaded dim_food: %d rows", len(dim_food))
+
+fact_rec.to_sql("fact_food_recommendation", engine, if_exists="append", index=False)
+logger.info("Loaded fact_food_recommendation: %d rows", len(fact_rec))
+
+logger.info("Warehouse load complete")

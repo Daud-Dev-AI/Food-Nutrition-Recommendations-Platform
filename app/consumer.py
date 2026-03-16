@@ -4,9 +4,10 @@ from kafka import KafkaConsumer
 from sqlalchemy import create_engine, text
 import pandas as pd
 
-DATABASE_URL = "postgresql+psycopg2://de_user:de_pass@localhost:5432/nutrition_dw"
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-KAFKA_TOPIC = "user_profiles"
+from app.config import DATABASE_URL, KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_GROUP_ID
+from app.logger import get_logger
+
+logger = get_logger("consumer")
 
 engine = create_engine(DATABASE_URL)
 
@@ -15,8 +16,8 @@ consumer = KafkaConsumer(
     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
     auto_offset_reset="earliest",
     enable_auto_commit=True,
-    group_id="nutrition-consumer-group",
-    value_deserializer=lambda m: json.loads(m.decode("utf-8"))
+    group_id=KAFKA_GROUP_ID,
+    value_deserializer=lambda m: json.loads(m.decode("utf-8")),
 )
 
 
@@ -62,11 +63,9 @@ def score_foods(goal_type: str, foods_df: pd.DataFrame) -> pd.DataFrame:
     df["recommendation_score"] = df["recommendation_score"].round(2)
     df["recommendation_reason"] = reason
 
-    # Deduplicate by food_name, keep best score
     df = df.sort_values(["food_name", "recommendation_score"], ascending=[True, False])
     df = df.drop_duplicates(subset=["food_name"], keep="first")
 
-    # Final top 10
     df = df.sort_values("recommendation_score", ascending=False).head(10).copy()
     df["recommendation_rank"] = range(1, len(df) + 1)
 
@@ -76,7 +75,7 @@ def score_foods(goal_type: str, foods_df: pd.DataFrame) -> pd.DataFrame:
 def upsert_user_profile(user_event: dict) -> str:
     goal_type = derive_goal_type(
         user_event["current_weight_lb"],
-        user_event["target_weight_lb"]
+        user_event["target_weight_lb"],
     )
 
     upsert_sql = text("""
@@ -108,54 +107,65 @@ def upsert_user_profile(user_event: dict) -> str:
             "height_cm": user_event["height_cm"],
             "current_weight_lb": user_event["current_weight_lb"],
             "target_weight_lb": user_event["target_weight_lb"],
-            "goal_type": goal_type
+            "goal_type": goal_type,
         })
 
+    logger.debug("Upserted dim_user_profile for user_id=%s goal_type=%s", user_event["user_id"], goal_type)
     return goal_type
 
 
 def regenerate_recommendations(user_event: dict, goal_type: str) -> None:
     foods_df = pd.read_sql("SELECT * FROM dim_food", engine)
+    logger.debug("Loaded %d foods from dim_food", len(foods_df))
 
     scored_df = score_foods(goal_type, foods_df)
     scored_df["user_id"] = user_event["user_id"]
     scored_df["goal_type"] = goal_type
 
-    fact_df = scored_df[
-        [
-            "user_id",
-            "food_name",
-            "goal_type",
-            "recommendation_score",
-            "recommendation_rank",
-            "recommendation_reason"
-        ]
-    ].copy()
+    fact_df = scored_df[[
+        "user_id",
+        "food_name",
+        "goal_type",
+        "recommendation_score",
+        "recommendation_rank",
+        "recommendation_reason",
+    ]].copy()
 
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM fact_food_recommendation WHERE user_id = :user_id"),
-            {"user_id": user_event["user_id"]}
+            {"user_id": user_event["user_id"]},
         )
 
     fact_df.to_sql("fact_food_recommendation", engine, if_exists="append", index=False)
+    logger.info(
+        "Regenerated %d recommendations for user_id=%s goal_type=%s",
+        len(fact_df),
+        user_event["user_id"],
+        goal_type,
+    )
 
 
 def main():
-    print("Kafka consumer started. Waiting for user profile events...")
+    logger.info("Kafka consumer started — topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID)
 
     for message in consumer:
         try:
             event = message.value
-            print(f"Received event: {event}")
+            logger.info(
+                "Received event: user_id=%s partition=%d offset=%d",
+                event.get("user_id"),
+                message.partition,
+                message.offset,
+            )
 
             goal_type = upsert_user_profile(event)
             regenerate_recommendations(event, goal_type)
 
-            print(f"Processed user {event['user_id']} with goal_type={goal_type}")
+            logger.info("Processed user_id=%s goal_type=%s", event["user_id"], goal_type)
 
         except Exception as e:
-            print(f"Error processing message: {e}")
+            logger.error("Error processing message: %s", e, exc_info=True)
             time.sleep(1)
 
 
