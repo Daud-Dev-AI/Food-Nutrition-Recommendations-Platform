@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from kafka import KafkaProducer
@@ -19,11 +21,41 @@ producer = KafkaProducer(
 )
 
 
+def _next_user_id(conn) -> str:
+    result = conn.execute(text("""
+        SELECT user_id FROM dim_user_profile  WHERE user_id ~ '^U[0-9]+$'
+        UNION
+        SELECT user_id FROM stg_user_profile_event WHERE user_id ~ '^U[0-9]+$'
+    """))
+    ids = [row[0] for row in result]
+    next_num = max((int(uid[1:]) for uid in ids), default=0) + 1
+    return f"U{next_num:03d}"
+
+
 class UserProfileRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, max_length=50)
     height_cm: float = Field(..., gt=0, le=300)
     current_weight_lb: float = Field(..., gt=0, le=800)
     target_weight_lb: float = Field(..., gt=0, le=800)
+
+
+_FIELD_MESSAGES = {
+    "height_cm": "height_cm must be greater than 0 and at most 300 cm",
+    "current_weight_lb": "current_weight_lb must be greater than 0 and at most 800 lb",
+    "target_weight_lb": "target_weight_lb must be greater than 0 and at most 800 lb",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    messages = []
+    for error in exc.errors():
+        field = error["loc"][-1] if error["loc"] else "unknown"
+        messages.append(_FIELD_MESSAGES.get(field, f"{field}: {error['msg']}"))
+    logger.warning("Validation error on %s: %s", request.url.path, messages)
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Invalid input", "details": messages},
+    )
 
 
 @app.get("/health")
@@ -58,8 +90,6 @@ def get_recommendations(user_id: str):
 
 @app.post("/users")
 def create_user_profile(payload: UserProfileRequest):
-    logger.info("Received profile submission for user_id=%s", payload.user_id)
-
     insert_query = text("""
         INSERT INTO stg_user_profile_event (
             user_id,
@@ -75,28 +105,30 @@ def create_user_profile(payload: UserProfileRequest):
         )
     """)
 
-    event = {
-        "user_id": payload.user_id,
-        "height_cm": payload.height_cm,
-        "current_weight_lb": payload.current_weight_lb,
-        "target_weight_lb": payload.target_weight_lb,
-    }
-
     try:
         with engine.begin() as conn:
+            user_id = _next_user_id(conn)
+            event = {
+                "user_id": user_id,
+                "height_cm": payload.height_cm,
+                "current_weight_lb": payload.current_weight_lb,
+                "target_weight_lb": payload.target_weight_lb,
+            }
             conn.execute(insert_query, event)
-        logger.debug("Staged event for user_id=%s", payload.user_id)
+        logger.info("Creating new user profile user_id=%s", user_id)
+        logger.debug("Staged event for user_id=%s", user_id)
 
         producer.send(KAFKA_TOPIC, value=event)
         producer.flush()
-        logger.info("Published Kafka event for user_id=%s to topic=%s", payload.user_id, KAFKA_TOPIC)
+        logger.info("Published Kafka event for user_id=%s to topic=%s", user_id, KAFKA_TOPIC)
 
         return {
             "message": "User profile received",
+            "user_id": user_id,
             "user_profile": event,
             "kafka_topic": KAFKA_TOPIC,
         }
 
     except Exception as e:
-        logger.error("Failed to process profile for user_id=%s: %s", payload.user_id, e)
+        logger.error("Failed to process profile: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")

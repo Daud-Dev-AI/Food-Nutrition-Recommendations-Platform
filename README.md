@@ -273,7 +273,6 @@ Submit a new user profile. Triggers Kafka event and recommendation generation.
 
 ```json
 {
-  "user_id": "U020",
   "height_cm": 175,
   "current_weight_lb": 210,
   "target_weight_lb": 185
@@ -281,15 +280,17 @@ Submit a new user profile. Triggers Kafka event and recommendation generation.
 ```
 
 Field constraints:
-- `user_id`: 1–50 characters
 - `height_cm`: > 0, ≤ 300
 - `current_weight_lb`: > 0, ≤ 800
 - `target_weight_lb`: > 0, ≤ 800
+
+A unique `user_id` is generated automatically in the format `U001`, `U002`, etc., continuing from the highest existing ID across both `dim_user_profile` and `stg_user_profile_event`. Use the returned `user_id` to fetch recommendations.
 
 ```
 200 OK
 {
   "message": "User profile received",
+  "user_id": "U004",
   "user_profile": { ... },
   "kafka_topic": "user_profiles"
 }
