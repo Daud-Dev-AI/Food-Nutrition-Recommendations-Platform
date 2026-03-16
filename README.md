@@ -211,23 +211,13 @@ python scripts/ingestion/load_gold_to_postgres.py
 
 ## Running the Streaming Components
 
-### Start the API
+### Start the API and Kafka Consumer
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-The API will be available at `http://localhost:8000`.
-
-### Start the Kafka Consumer
-
-In a separate terminal:
-
-```bash
-python -m app.consumer
-```
-
-The consumer will block and listen for incoming user profile events.
+The API will be available at `http://localhost:8000`. The Kafka consumer starts automatically as a background thread within the same process — no separate terminal needed.
 
 ---
 

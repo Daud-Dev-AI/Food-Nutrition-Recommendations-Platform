@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -5,13 +6,25 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from kafka import KafkaProducer
 import json
+import threading
 
 from app.config import DATABASE_URL, KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC
 from app.logger import get_logger
+from app.consumer import main as consumer_main
 
 logger = get_logger("api")
 
-app = FastAPI(title="Nutrition Recommendation API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=consumer_main, daemon=True, name="kafka-consumer")
+    thread.start()
+    logger.info("Kafka consumer thread started")
+    yield
+    logger.info("Shutting down — Kafka consumer thread will exit with process")
+
+
+app = FastAPI(title="Nutrition Recommendation API", lifespan=lifespan)
 
 engine = create_engine(DATABASE_URL)
 

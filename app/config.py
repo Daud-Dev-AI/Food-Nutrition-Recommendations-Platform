@@ -20,5 +20,11 @@ KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "user_profiles")
 KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "nutrition-consumer-group")
 
+# MinIO
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minio")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minio123")
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "nutrition-platform")
+
 # Logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
