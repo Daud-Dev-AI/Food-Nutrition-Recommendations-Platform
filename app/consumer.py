@@ -1,5 +1,7 @@
 import json
 import time
+from datetime import date
+from typing import Optional
 from kafka import KafkaConsumer
 from sqlalchemy import create_engine, text
 import pandas as pd
@@ -21,6 +23,10 @@ consumer = KafkaConsumer(
 )
 
 
+# ──────────────────────────────────────────────────────────────
+# Pure-function helpers (no DB side effects)
+# ──────────────────────────────────────────────────────────────
+
 def derive_goal_type(current_weight_lb: float, target_weight_lb: float) -> str:
     if target_weight_lb < current_weight_lb:
         return "weight_loss"
@@ -29,7 +35,24 @@ def derive_goal_type(current_weight_lb: float, target_weight_lb: float) -> str:
     return "maintenance"
 
 
+def calculate_age(birth_date_str) -> Optional[int]:
+    """Return age in whole years from an ISO date string or date object."""
+    if not birth_date_str:
+        return None
+    try:
+        bd = date.fromisoformat(str(birth_date_str)) if not isinstance(birth_date_str, date) else birth_date_str
+        today = date.today()
+        return today.year - bd.year - ((today.month, today.day) < (bd.month, bd.day))
+    except Exception:
+        return None
+
+
 def score_foods(goal_type: str, foods_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Score and rank all foods for a given goal_type.
+    Returns a Pandas DataFrame with recommendation_score, recommendation_rank,
+    recommendation_reason — top 10, deduplicated by food_name.
+    """
     df = foods_df.copy()
 
     if goal_type == "weight_loss":
@@ -51,7 +74,7 @@ def score_foods(goal_type: str, foods_df: pd.DataFrame) -> pd.DataFrame:
         )
         reason = "Higher calories and protein for weight gain support"
 
-    else:
+    else:  # maintenance
         df["recommendation_score"] = (
             df["protein_g"] * 2.0
             + df["fiber_g"] * 1.5
@@ -63,63 +86,99 @@ def score_foods(goal_type: str, foods_df: pd.DataFrame) -> pd.DataFrame:
     df["recommendation_score"] = df["recommendation_score"].round(2)
     df["recommendation_reason"] = reason
 
+    # Deduplicate by food_name — keep the row with the highest score
     df = df.sort_values(["food_name", "recommendation_score"], ascending=[True, False])
     df = df.drop_duplicates(subset=["food_name"], keep="first")
 
+    # Take top 10 and assign ordinal ranks
     df = df.sort_values("recommendation_score", ascending=False).head(10).copy()
     df["recommendation_rank"] = range(1, len(df) + 1)
 
     return df
 
 
+# ──────────────────────────────────────────────────────────────
+# Database write functions
+# ──────────────────────────────────────────────────────────────
+
 def upsert_user_profile(user_event: dict) -> str:
+    """
+    Insert or update dim_user_profile for this user.
+    Returns the derived goal_type so the caller can regenerate recommendations.
+    """
     goal_type = derive_goal_type(
         user_event["current_weight_lb"],
         user_event["target_weight_lb"],
     )
+    age = calculate_age(user_event.get("birth_date"))
 
     upsert_sql = text("""
         INSERT INTO dim_user_profile (
-            user_id,
-            height_cm,
-            current_weight_lb,
-            target_weight_lb,
-            goal_type
+            user_id, user_name, gender, birth_date, age,
+            height_cm, current_weight_lb, target_weight_lb,
+            goal_type, updated_at
         )
         VALUES (
-            :user_id,
-            :height_cm,
-            :current_weight_lb,
-            :target_weight_lb,
-            :goal_type
+            :user_id, :user_name, :gender, :birth_date, :age,
+            :height_cm, :current_weight_lb, :target_weight_lb,
+            :goal_type, CURRENT_TIMESTAMP
         )
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-            height_cm = EXCLUDED.height_cm,
+        ON CONFLICT (user_id) DO UPDATE SET
+            user_name         = EXCLUDED.user_name,
+            gender            = EXCLUDED.gender,
+            birth_date        = EXCLUDED.birth_date,
+            age               = EXCLUDED.age,
+            height_cm         = EXCLUDED.height_cm,
             current_weight_lb = EXCLUDED.current_weight_lb,
-            target_weight_lb = EXCLUDED.target_weight_lb,
-            goal_type = EXCLUDED.goal_type
+            target_weight_lb  = EXCLUDED.target_weight_lb,
+            goal_type         = EXCLUDED.goal_type,
+            updated_at        = CURRENT_TIMESTAMP
     """)
 
     with engine.begin() as conn:
         conn.execute(upsert_sql, {
-            "user_id": user_event["user_id"],
-            "height_cm": user_event["height_cm"],
-            "current_weight_lb": user_event["current_weight_lb"],
-            "target_weight_lb": user_event["target_weight_lb"],
-            "goal_type": goal_type,
+            "user_id":           user_event["user_id"],
+            "user_name":         user_event.get("user_name"),
+            "gender":            user_event.get("gender"),
+            "birth_date":        user_event.get("birth_date"),
+            "age":               age,
+            "height_cm":         user_event.get("height_cm"),
+            "current_weight_lb": user_event.get("current_weight_lb"),
+            "target_weight_lb":  user_event.get("target_weight_lb"),
+            "goal_type":         goal_type,
         })
 
-    logger.debug("Upserted dim_user_profile for user_id=%s goal_type=%s", user_event["user_id"], goal_type)
+    logger.debug("Upserted dim_user_profile user_id=%s goal_type=%s", user_event["user_id"], goal_type)
     return goal_type
 
 
+def delete_user(user_id: str) -> None:
+    """
+    Remove a user and all their recommendation rows from PostgreSQL.
+    Fact rows are deleted first to maintain referential cleanliness.
+    """
+    with engine.begin() as conn:
+        rec_count = conn.execute(
+            text("DELETE FROM fact_food_recommendation WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).rowcount
+        conn.execute(
+            text("DELETE FROM dim_user_profile WHERE user_id = :uid"),
+            {"uid": user_id},
+        )
+    logger.info("Deleted user_id=%s — removed %d recommendation row(s)", user_id, rec_count)
+
+
 def regenerate_recommendations(user_event: dict, goal_type: str) -> None:
+    """
+    Score all foods for the user's goal_type and replace their existing
+    fact_food_recommendation rows with the freshly ranked top 10.
+    """
     foods_df = pd.read_sql("SELECT * FROM dim_food", engine)
     logger.debug("Loaded %d foods from dim_food", len(foods_df))
 
     scored_df = score_foods(goal_type, foods_df)
-    scored_df["user_id"] = user_event["user_id"]
+    scored_df["user_id"]   = user_event["user_id"]
     scored_df["goal_type"] = goal_type
 
     fact_df = scored_df[[
@@ -146,23 +205,41 @@ def regenerate_recommendations(user_event: dict, goal_type: str) -> None:
     )
 
 
+# ──────────────────────────────────────────────────────────────
+# Main consumer loop
+# ──────────────────────────────────────────────────────────────
+
 def main():
     logger.info("Kafka consumer started — topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID)
 
     for message in consumer:
         try:
             event = message.value
+            user_id    = event.get("user_id")
+            event_type = event.get("event_type", "create")  # backward-compat default
+
             logger.info(
-                "Received event: user_id=%s partition=%d offset=%d",
-                event.get("user_id"),
-                message.partition,
-                message.offset,
+                "Received event: user_id=%s event_type=%s partition=%d offset=%d",
+                user_id, event_type, message.partition, message.offset,
             )
 
-            goal_type = upsert_user_profile(event)
-            regenerate_recommendations(event, goal_type)
+            if event_type == "delete":
+                delete_user(user_id)
+                logger.info("Processed delete for user_id=%s", user_id)
 
-            logger.info("Processed user_id=%s goal_type=%s", event["user_id"], goal_type)
+            elif event_type in ("create", "update"):
+                goal_type = upsert_user_profile(event)
+                regenerate_recommendations(event, goal_type)
+                logger.info(
+                    "Processed %s for user_id=%s goal_type=%s",
+                    event_type, user_id, goal_type,
+                )
+
+            else:
+                logger.warning(
+                    "Unknown event_type=%s for user_id=%s — skipping",
+                    event_type, user_id,
+                )
 
         except Exception as e:
             logger.error("Error processing message: %s", e, exc_info=True)

@@ -1,22 +1,63 @@
+# YAML anchor — shared config for all Airflow services.
+# Must be at the top level (outside `services`) to be valid.
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  environment:
+    &airflow-env
+    AIRFLOW__CORE__EXECUTOR:             LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://de_user:de_pass@postgres/airflow_db
+    AIRFLOW__CORE__LOAD_EXAMPLES:        "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY:      "nutrition-platform-dev-secret"
+    # Spark connection used by SparkSubmitOperator in the DAG
+    AIRFLOW_CONN_SPARK_DEFAULT:          "spark://spark-master:7077"
+    # Paths mounted into the Airflow container
+    DATA_BASE_PATH:                      /opt/project/data
+    PROJECT_ROOT:                        /opt/project
+    # PostgreSQL credentials for the load_gold_to_postgres BashOperator task
+    POSTGRES_HOST:                       postgres
+    POSTGRES_PORT:                       "5432"
+    POSTGRES_DB:                         nutrition_dw
+    POSTGRES_USER:                       de_user
+    POSTGRES_PASSWORD:                   de_pass
+    LOG_LEVEL:                           INFO
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./:/opt/project
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    - postgres
+    - spark-master
+
+
 services:
+
+  # ── Data Warehouse ────────────────────────────────────────────
   postgres:
     image: postgres:16
     container_name: de_postgres
     environment:
-      POSTGRES_USER: de_user
+      POSTGRES_USER:     de_user
       POSTGRES_PASSWORD: de_pass
-      POSTGRES_DB: nutrition_dw
+      POSTGRES_DB:       nutrition_dw
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates airflow_db on first container init (only runs when volume is empty).
+      # If the volume already exists, run once manually:
+      #   docker exec de_postgres psql -U de_user -c "CREATE DATABASE airflow_db;"
+      - ./scripts/sql/create_airflow_db.sql:/docker-entrypoint-initdb.d/01_create_airflow_db.sql
 
+  # ── Messaging ────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
     container_name: de_zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_TICK_TIME:   2000
     ports:
       - "2181:2181"
 
@@ -29,20 +70,21 @@ services:
       - "9092:9092"
       - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID:                        1
+      KAFKA_ZOOKEEPER_CONNECT:                zookeeper:2181
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:   PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS:             PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENERS:                        PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME:       PLAINTEXT_INTERNAL
 
+  # ── Object Storage ───────────────────────────────────────────
   minio:
     image: minio/minio:latest
     container_name: de_minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minio
+      MINIO_ROOT_USER:     minio
       MINIO_ROOT_PASSWORD: minio123
     ports:
       - "9000:9000"
@@ -50,6 +92,7 @@ services:
     volumes:
       - minio_data:/data
 
+  # ── Spark Cluster ─────────────────────────────────────────────
   spark-master:
     image: apache/spark:3.5.2
     container_name: de_spark_master
@@ -71,6 +114,53 @@ services:
     volumes:
       - ./:/opt/project
 
+  # ── Airflow (Orchestration) ───────────────────────────────────
+  # Custom image (./airflow/Dockerfile) adds Java + PySpark so
+  # SparkSubmitOperator can call spark-submit and connect to the cluster.
+  # LocalExecutor runs tasks in subprocesses — no Redis/Celery needed.
+  # Metadata DB: airflow_db on the shared postgres container.
+  #
+  # Web UI: http://localhost:8082  (admin / admin)
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: de_airflow_init
+    # Initialise the Airflow metadata DB and create the admin user.
+    # This service exits after setup; it is not a long-running process.
+    command: >
+      bash -c "
+        airflow db upgrade &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@nutrition.local
+          2>/dev/null || echo 'Admin user already exists'
+      "
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: de_airflow_webserver
+    command: airflow webserver
+    ports:
+      - "8082:8080"
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: de_airflow_scheduler
+    command: airflow scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+
+
 volumes:
   postgres_data:
   minio_data:
+  airflow_logs:
