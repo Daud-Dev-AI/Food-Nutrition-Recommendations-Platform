@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, when, lit, regexp_extract, trim, lower
@@ -32,6 +33,7 @@ output_path = os.path.join(BASE_PATH, "silver", "food_nutrition_clean")
 spark = (
     SparkSession.builder
     .appName("bronze-to-silver-food-nutrition")
+    .config("spark.hadoop.fs.permissions.umask-mode", "000")
     .getOrCreate()
 )
 
@@ -144,6 +146,7 @@ run_checks([
     check_categorical(df, "fat_band",     VALID_BANDS, label="silver"),
 ], stage="silver_post_transform")
 
+shutil.rmtree(output_path, ignore_errors=True)
 df.write.mode("overwrite").parquet(output_path)
 
 row_count = df.count()

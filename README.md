@@ -48,6 +48,13 @@ nutrition.csv (raw)
        │ DQ: warehouse row counts, dim_user unique, FK integrity
        ▼
  PostgreSQL — nutrition_dw
+
+       │  (optional, run after load)
+       ▼
+ [Python] archive_to_minio.py
+       │  - upload bronze / silver / gold Parquet files
+       ▼
+ MinIO — nutrition-platform bucket  (S3-compatible object storage)
 ```
 
 ### Streaming Pipeline (event-driven, near real-time)
@@ -70,12 +77,14 @@ POST /users          PUT /users/{id}        DELETE /users/{id}
               create/update                      delete
                     │                              │
                     ▼                              ▼
-           upsert dim_user_profile      DELETE dim_user_profile
-           score foods + rebuild        DELETE fact_food_recommendation
-           fact_food_recommendation
+        SCD2: expire current row        hard-delete all SCD versions
+        insert new version              DELETE fact_food_recommendation
+        score foods + rebuild
+        fact_food_recommendation
                     │
                     ▼
        GET /recommendations/{user_id}  →  fresh results
+       GET /users/{user_id}/history    →  full version timeline
 ```
 
 ---
@@ -205,6 +214,52 @@ python scripts/ingestion/load_gold_to_postgres.py
 
 Each Spark job logs data quality check results inline. A `FAIL` on any critical check raises an exception and stops the job.
 
+### Step 5 — Archive Parquet layers to MinIO (optional)
+
+Run after Step 4. Uploads all bronze, silver, and gold Parquet files to the `nutrition-platform` bucket in MinIO for object storage demo:
+
+```bash
+python scripts/archival/archive_to_minio.py
+```
+
+Browse the uploaded files at `http://localhost:9001` (login: `minio` / `minio123`) → Buckets → `nutrition-platform`.
+
+---
+
+## MinIO Object Storage
+
+MinIO provides S3-compatible object storage for archiving the processed Parquet layers. It is included to demonstrate a realistic production pattern where intermediate and final datasets are stored durably in object storage — separate from the compute layer.
+
+### What gets archived
+
+| Layer | Path in MinIO |
+|---|---|
+| Bronze | `bronze/food_nutrition/*.parquet` |
+| Silver | `silver/food_nutrition_clean/*.parquet` |
+| Gold | `gold/food_recommendations/*.parquet` |
+| Gold | `gold/user_profiles_enriched/*.parquet` |
+
+### Running the archive script
+
+```bash
+# Ensure .env is loaded (MINIO_ENDPOINT, MINIO_ACCESS_KEY, etc.)
+python scripts/archival/archive_to_minio.py
+```
+
+The script:
+1. Connects to MinIO at `http://localhost:9000`
+2. Creates the `nutrition-platform` bucket if it does not exist
+3. Recursively finds all `.parquet` files in `data/bronze`, `data/silver`, `data/gold`
+4. Uploads each file preserving the relative path as the S3 key
+
+### Browsing MinIO
+
+| URL | Credentials |
+|---|---|
+| `http://localhost:9001` | `minio` / `minio123` |
+
+Go to **Buckets → nutrition-platform** to browse and download the archived Parquet files.
+
 ---
 
 ## Running Airflow
@@ -313,6 +368,61 @@ Returns `404` if no recommendations exist for the user.
 
 Returns `201` with the generated `user_id`.
 
+### GET /users/{user_id} — Get current profile
+
+Returns the latest (active) version of the user's profile.
+
+```json
+{
+  "user_id": "U001",
+  "user_name": "James Carter",
+  "gender": "male",
+  "birth_date": "1988-04-12",
+  "age": 37,
+  "height_cm": 175.0,
+  "current_weight_lb": 210.0,
+  "target_weight_lb": 185.0,
+  "goal_type": "weight_loss",
+  "effective_start": "2026-04-01T10:00:00",
+  "version_number": 1
+}
+```
+
+Returns `404` if the user does not exist.
+
+### GET /users/{user_id}/history — Get full version history
+
+Returns all SCD Type 2 versions in chronological order. Use this endpoint to reconstruct the full timeline of a user's profile changes.
+
+```json
+{
+  "user_id": "U001",
+  "total_versions": 2,
+  "history": [
+    {
+      "version_number": 1,
+      "current_weight_lb": 210.0,
+      "target_weight_lb": 185.0,
+      "goal_type": "weight_loss",
+      "effective_start": "2026-04-01T10:00:00",
+      "effective_end": "2026-04-01T11:30:00",
+      "is_current": false
+    },
+    {
+      "version_number": 2,
+      "current_weight_lb": 205.0,
+      "target_weight_lb": 185.0,
+      "goal_type": "weight_loss",
+      "effective_start": "2026-04-01T11:30:00",
+      "effective_end": null,
+      "is_current": true
+    }
+  ]
+}
+```
+
+Returns `404` if the user does not exist.
+
 ### PUT /users/{user_id} — Update user
 
 Send only the fields you want to change. All other fields are merged from the existing record.
@@ -324,44 +434,52 @@ Send only the fields you want to change. All other fields are merged from the ex
 }
 ```
 
-Publishes an `update` Kafka event. Consumer upserts the dimension and regenerates recommendations.
+Publishes an `update` Kafka event. Consumer **expires the current row** (stamps `effective_end`, sets `is_current = FALSE`) and **inserts a new version** with an incremented `version_number`. Recommendations are regenerated from the new profile state.
 
 ### DELETE /users/{user_id} — Delete user
 
 No body required.
 
-Publishes a `delete` Kafka event. Consumer removes the user from `dim_user_profile` and all their rows from `fact_food_recommendation`.
+Publishes a `delete` Kafka event. Consumer hard-deletes **all SCD versions** for this user from `dim_user_profile`, plus all rows from `fact_food_recommendation` and `stg_user_profile_event`. No history is retained after deletion.
 
 ---
 
-## Testing Create / Update / Delete
+## Testing Create / Update / Delete / History
 
 ```bash
 BASE=http://localhost:8000
 
-# Create
+# Create — note the returned user_id (e.g. U004)
 curl -s -X POST $BASE/users \
   -H "Content-Type: application/json" \
   -d '{"user_name":"Bob Jones","gender":"male","birth_date":"1985-03-20","height_cm":180,"current_weight_lb":200,"target_weight_lb":175}' \
   | python3 -m json.tool
 
-# Fetch recommendations (replace U001 with your returned user_id)
-curl -s $BASE/recommendations/U001 | python3 -m json.tool
+# Fetch current profile (version 1)
+curl -s $BASE/users/U004 | python3 -m json.tool
 
-# Update — change only the target weight
-curl -s -X PUT $BASE/users/U001 \
+# Fetch recommendations (version 1 goal_type)
+curl -s $BASE/recommendations/U004 | python3 -m json.tool
+
+# Update — change weight, triggering SCD2 version 2
+curl -s -X PUT $BASE/users/U004 \
   -H "Content-Type: application/json" \
-  -d '{"target_weight_lb": 170}' \
+  -d '{"current_weight_lb": 190}' \
   | python3 -m json.tool
 
-# Verify recommendations regenerated
-curl -s $BASE/recommendations/U001 | python3 -m json.tool
+# Verify recommendations were regenerated with the updated profile
+curl -s $BASE/recommendations/U004 | python3 -m json.tool
 
-# Delete
-curl -s -X DELETE $BASE/users/U001 | python3 -m json.tool
+# View the full version history — both versions should appear
+curl -s $BASE/users/U004/history | python3 -m json.tool
+# version 1: effective_end is set, is_current = false
+# version 2: effective_end is null, is_current = true
+
+# Delete — hard-removes all versions and recommendations
+curl -s -X DELETE $BASE/users/U004 | python3 -m json.tool
 
 # Confirm gone (should return 404)
-curl -s $BASE/recommendations/U001
+curl -s $BASE/users/U004
 ```
 
 ---
@@ -397,17 +515,29 @@ run_checks(checks, stage="my_stage", fail_on_error=False)
 
 ## User Schema
 
+**Business fields**
+
 | Field | Type | Notes |
 |---|---|---|
 | `user_id` | VARCHAR(50) | Auto-generated: U001, U002, … |
 | `user_name` | VARCHAR(100) | Full display name |
 | `gender` | VARCHAR(30) | `male` \| `female` \| `other` \| `prefer_not_to_say` |
 | `birth_date` | DATE | ISO date; stored as-is |
-| `age` | INTEGER | Derived from `birth_date` at write time; updated on each upsert |
+| `age` | INTEGER | Derived from `birth_date` at write time; recalculated on each version |
 | `height_cm` | NUMERIC | > 0, ≤ 300 |
 | `current_weight_lb` | NUMERIC | > 0, ≤ 800 |
 | `target_weight_lb` | NUMERIC | > 0, ≤ 800 |
 | `goal_type` | VARCHAR(50) | Derived: `weight_loss` \| `weight_gain` \| `maintenance` |
+
+**SCD Type 2 tracking fields** (managed automatically — do not set manually)
+
+| Field | Type | Notes |
+|---|---|---|
+| `user_profile_key` | SERIAL | Surrogate primary key — unique per row/version |
+| `effective_start` | TIMESTAMP | When this version became active |
+| `effective_end` | TIMESTAMP | When this version was superseded (`NULL` = currently active) |
+| `is_current` | BOOLEAN | `TRUE` for exactly one row per `user_id` at any time |
+| `version_number` | INTEGER | Monotonically increasing: 1, 2, 3, … |
 
 ---
 
@@ -472,6 +602,83 @@ Top 10 foods per user are kept after deduplication by food name.
 
 ---
 
+## SCD Type 2 — User Progress Tracking
+
+Every `PUT /users/{id}` call creates a new **version** of the user's profile rather than overwriting the previous one. This is the [SCD Type 2](https://en.wikipedia.org/wiki/Slowly_changing_dimension#Type_2:_add_new_row) pattern — the full history of every profile change is retained in `dim_user_profile`, making it possible to plot a user's weight journey over time in Tableau.
+
+### How it works
+
+1. **Create** — a `POST /users` call inserts version 1 with `effective_end = NULL`, `is_current = TRUE`.
+2. **Update** — a `PUT /users/{id}` call does two things in a single transaction:
+   - Stamps `effective_end = NOW()` and `is_current = FALSE` on the current row (expires it).
+   - Inserts a new row with the updated fields, `version_number` incremented, and `is_current = TRUE`.
+3. **Delete** — hard-deletes all SCD versions for the user, plus all recommendations and staging events.
+
+A partial unique index (`WHERE is_current = TRUE`) enforces that exactly one active row exists per `user_id` at all times — violated by any bug that would create two concurrent active versions.
+
+### Querying the history
+
+```sql
+-- Current state only
+SELECT * FROM dim_user_profile WHERE user_id = 'U001' AND is_current = TRUE;
+
+-- Full version timeline
+SELECT user_id, version_number, current_weight_lb, effective_start, effective_end, is_current
+FROM dim_user_profile
+WHERE user_id = 'U001'
+ORDER BY version_number;
+
+-- State at a specific point in time
+SELECT * FROM dim_user_profile
+WHERE user_id = 'U001'
+  AND effective_start <= '2026-04-01 12:00:00'
+  AND (effective_end > '2026-04-01 12:00:00' OR effective_end IS NULL);
+```
+
+### Schema migration (re-run after pulling this change)
+
+If you have an existing `postgres_data` volume from before SCD2 was added, re-initialise the schema:
+
+```bash
+docker exec -i de_postgres psql -U de_user -d nutrition_dw < scripts/sql/create_schema.sql
+```
+
+Then re-run the full batch pipeline to reload `dim_user_profile` with the SCD2 columns:
+
+```bash
+docker exec de_spark_master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/project/spark_jobs/batch/raw_to_bronze.py
+
+docker exec de_spark_master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/project/spark_jobs/batch/bronze_to_silver.py
+
+docker exec de_spark_master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/project/spark_jobs/batch/silver_to_gold_recommendations.py
+
+python scripts/ingestion/load_gold_to_postgres.py
+```
+
+### Tableau — progress tracking view
+
+Connect to `vw_user_progress_history` for weight-over-time charts:
+
+| Field | Tableau role |
+|---|---|
+| `changed_at` | X-axis (continuous date) |
+| `current_weight_lb` | Primary measure |
+| `target_weight_lb` | Reference line |
+| `weight_delta_lb` | Gap to goal (positive = over target) |
+| `progress_status` | Colour dimension (`initial` / `improving` / `not_improving` / `unchanged`) |
+| `user_id`, `user_name` | Filter / detail |
+| `is_current` | Optional filter to show only the latest snapshot |
+
+Suggested chart: **dual-line chart** with `current_weight_lb` and `target_weight_lb` on the Y-axis, `changed_at` on X, coloured by `progress_status`. Each point represents one profile version; hover details show `version_number` and `goal_type`.
+
+---
+
 ## Database Schema
 
 **nutrition_dw**
@@ -479,26 +686,29 @@ Top 10 foods per user are kept after deduplication by food name.
 | Table / View | Description |
 |---|---|
 | `stg_user_profile_event` | Append-only event log (create / update / delete) |
-| `dim_user_profile` | Current user state — upserted on create/update, deleted on delete |
+| `dim_user_profile` | SCD Type 2 user dimension — one row per version; current state filtered by `is_current = TRUE` |
 | `dim_food` | Cleaned and enriched food catalogue from silver layer |
-| `fact_food_recommendation` | Scored top-10 recommendations per user |
-| `vw_recommendation_report` | Flat BI view joining all layers |
+| `fact_food_recommendation` | Scored top-10 recommendations per user (current state only) |
+| `vw_recommendation_report` | Flat BI view joining all layers; filters `is_current = TRUE` |
+| `vw_user_goal_summary` | Current-state user overview for demographic/goal charts |
+| `vw_food_nutrition_profile` | One row per food for nutritional comparison charts |
+| `vw_user_progress_history` | Full SCD2 timeline per user with `progress_status` — primary Tableau view |
 
 ---
 
 ## Infrastructure Ports
 
-| Service | Port |
-|---|---|
-| PostgreSQL | 5432 |
-| Kafka | 9092 |
-| Zookeeper | 2181 |
-| MinIO API | 9000 |
-| MinIO Console | 9001 |
-| Spark Master UI | 8080 |
-| Spark Worker UI | 8081 |
-| FastAPI | 8000 |
-| Airflow Web UI | 8082 |
+| Service | Port | Credentials |
+|---|---|---|
+| PostgreSQL | 5432 | de_user / de_pass |
+| Kafka | 9092 | — |
+| Zookeeper | 2181 | — |
+| MinIO API | 9000 | — |
+| MinIO Console | 9001 | minio / minio123 |
+| Spark Master UI | 8080 | — |
+| Spark Worker UI | 8081 | — |
+| FastAPI | 8000 | — |
+| Airflow Web UI | 8082 | admin / admin |
 
 ---
 

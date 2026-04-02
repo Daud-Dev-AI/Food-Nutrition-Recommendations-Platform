@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lower, trim, regexp_replace
@@ -34,6 +35,9 @@ run_checks([
 spark = (
     SparkSession.builder
     .appName("raw-to-bronze-food-nutrition")
+    # umask 000 ensures output files are world-writable so any container
+    # user (spark uid 185, airflow uid 50000, etc.) can overwrite them.
+    .config("spark.hadoop.fs.permissions.umask-mode", "000")
     .getOrCreate()
 )
 
@@ -76,6 +80,7 @@ run_checks([
     check_not_null(df, "label", label="bronze"),
 ], stage="bronze_post_transform")
 
+shutil.rmtree(output_path, ignore_errors=True)
 df.write.mode("overwrite").parquet(output_path)
 
 row_count = df.count()

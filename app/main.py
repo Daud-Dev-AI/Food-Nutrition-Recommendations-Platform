@@ -7,7 +7,7 @@ import threading
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import create_engine, text
 from kafka import KafkaProducer
 
@@ -51,11 +51,16 @@ producer = KafkaProducer(
 # ──────────────────────────────────────────────────────────────
 
 def _next_user_id(conn) -> str:
-    """Generate next sequential user_id (U001, U002, …) from existing rows."""
+    """
+    Generate next sequential user_id (U001, U002, …).
+    Uses DISTINCT on dim_user_profile so historical SCD rows don't
+    inflate the count — each user_id is counted once regardless of
+    how many versions exist.
+    """
     result = conn.execute(text("""
-        SELECT user_id FROM dim_user_profile  WHERE user_id ~ '^U[0-9]+$'
+        SELECT DISTINCT user_id FROM dim_user_profile  WHERE user_id ~ '^U[0-9]+$'
         UNION
-        SELECT user_id FROM stg_user_profile_event WHERE user_id ~ '^U[0-9]+$'
+        SELECT DISTINCT user_id FROM stg_user_profile_event WHERE user_id ~ '^U[0-9]+$'
     """))
     ids = [row[0] for row in result]
     next_num = max((int(uid[1:]) for uid in ids), default=0) + 1
@@ -63,8 +68,9 @@ def _next_user_id(conn) -> str:
 
 
 def _get_existing_user(conn, user_id: str) -> Optional[dict]:
+    """Return the current (is_current=TRUE) version of a user, or None."""
     row = conn.execute(
-        text("SELECT * FROM dim_user_profile WHERE user_id = :uid"),
+        text("SELECT * FROM dim_user_profile WHERE user_id = :uid AND is_current = TRUE"),
         {"uid": user_id},
     ).mappings().first()
     return dict(row) if row else None
@@ -82,6 +88,22 @@ class UserProfileRequest(BaseModel):
     current_weight_lb: float = Field(..., gt=0, le=800)
     target_weight_lb: float = Field(..., gt=0, le=800)
 
+    @field_validator("gender")
+    @classmethod
+    def gender_must_be_valid(cls, v: str) -> str:
+        if v not in VALID_GENDERS:
+            raise ValueError(f"must be one of: {sorted(VALID_GENDERS)}")
+        return v
+
+    @field_validator("birth_date")
+    @classmethod
+    def birth_date_must_be_in_past(cls, v: date) -> date:
+        if v >= date.today():
+            raise ValueError("birth_date must be in the past")
+        if v.year < 1900:
+            raise ValueError("birth_date must be after 1900-01-01")
+        return v
+
 
 class UserProfileUpdateRequest(BaseModel):
     """All fields optional — only supplied fields are updated."""
@@ -91,6 +113,23 @@ class UserProfileUpdateRequest(BaseModel):
     height_cm: Optional[float] = Field(None, gt=0, le=300)
     current_weight_lb: Optional[float] = Field(None, gt=0, le=800)
     target_weight_lb: Optional[float] = Field(None, gt=0, le=800)
+
+    @field_validator("gender")
+    @classmethod
+    def gender_must_be_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_GENDERS:
+            raise ValueError(f"must be one of: {sorted(VALID_GENDERS)}")
+        return v
+
+    @field_validator("birth_date")
+    @classmethod
+    def birth_date_must_be_in_past(cls, v: Optional[date]) -> Optional[date]:
+        if v is not None:
+            if v >= date.today():
+                raise ValueError("birth_date must be in the past")
+            if v.year < 1900:
+                raise ValueError("birth_date must be after 1900-01-01")
+        return v
 
 
 _FIELD_MESSAGES = {
@@ -151,12 +190,6 @@ def get_recommendations(user_id: str):
 @app.post("/users", status_code=201)
 def create_user_profile(payload: UserProfileRequest):
     """Create a new user. Publishes a 'create' event to Kafka."""
-    if payload.gender not in VALID_GENDERS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"gender must be one of: {sorted(VALID_GENDERS)}",
-        )
-
     insert_staging = text("""
         INSERT INTO stg_user_profile_event (
             user_id, event_type, user_name, gender, birth_date,
@@ -202,14 +235,9 @@ def create_user_profile(payload: UserProfileRequest):
 def update_user_profile(user_id: str, payload: UserProfileUpdateRequest):
     """
     Update an existing user. Only supplied fields are changed; the rest are
-    merged from the current dim_user_profile row. Publishes an 'update' event.
+    merged from the current dim_user_profile row. Publishes an 'update' event
+    which triggers recommendation regeneration via the Kafka consumer.
     """
-    if payload.gender is not None and payload.gender not in VALID_GENDERS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"gender must be one of: {sorted(VALID_GENDERS)}",
-        )
-
     with engine.connect() as conn:
         existing = _get_existing_user(conn, user_id)
 
@@ -260,6 +288,60 @@ def update_user_profile(user_id: str, payload: UserProfileUpdateRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/users/{user_id}")
+def get_user_profile(user_id: str):
+    """Return the current (latest) version of a user's profile."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT user_id, user_name, gender, birth_date, age,
+                       height_cm, current_weight_lb, target_weight_lb,
+                       goal_type, effective_start, version_number
+                FROM dim_user_profile
+                WHERE user_id = :uid AND is_current = TRUE
+            """),
+            {"uid": user_id},
+        ).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    logger.info("Fetched current profile for user_id=%s", user_id)
+    return dict(row)
+
+
+@app.get("/users/{user_id}/history")
+def get_user_history(user_id: str):
+    """
+    Return all SCD Type 2 versions of a user's profile in chronological order.
+    Each entry represents a snapshot of the user at a point in time.
+    Use effective_start / effective_end to reconstruct the timeline.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT user_id, user_name, gender, birth_date, age,
+                       height_cm, current_weight_lb, target_weight_lb,
+                       goal_type, effective_start, effective_end,
+                       is_current, version_number
+                FROM dim_user_profile
+                WHERE user_id = :uid
+                ORDER BY version_number ASC
+            """),
+            {"uid": user_id},
+        ).mappings().all()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    logger.info("Fetched %d history version(s) for user_id=%s", len(rows), user_id)
+    return {
+        "user_id":        user_id,
+        "total_versions": len(rows),
+        "history":        [dict(r) for r in rows],
+    }
+
+
 @app.delete("/users/{user_id}")
 def delete_user_profile(user_id: str):
     """
@@ -268,7 +350,7 @@ def delete_user_profile(user_id: str):
     """
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT user_id FROM dim_user_profile WHERE user_id = :uid"),
+            text("SELECT user_id FROM dim_user_profile WHERE user_id = :uid AND is_current = TRUE"),
             {"uid": user_id},
         ).first()
 

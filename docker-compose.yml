@@ -11,8 +11,11 @@ x-airflow-common:
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://de_user:de_pass@postgres/airflow_db
     AIRFLOW__CORE__LOAD_EXAMPLES:        "false"
     AIRFLOW__WEBSERVER__SECRET_KEY:      "nutrition-platform-dev-secret"
-    # Spark connection used by SparkSubmitOperator in the DAG
-    AIRFLOW_CONN_SPARK_DEFAULT:          "spark://spark-master:7077"
+    # Spark connection used by SparkSubmitOperator in the DAG.
+    # JSON format is required so the full spark:// URL lands in the host field.
+    # Plain URI (spark://spark-master:7077) causes Airflow to strip the scheme,
+    # resulting in --master spark-master:7077 (missing spark://) which fails.
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
     # Paths mounted into the Airflow container
     DATA_BASE_PATH:                      /opt/project/data
     PROJECT_ROOT:                        /opt/project
@@ -127,18 +130,7 @@ services:
     container_name: de_airflow_init
     # Initialise the Airflow metadata DB and create the admin user.
     # This service exits after setup; it is not a long-running process.
-    command: >
-      bash -c "
-        airflow db upgrade &&
-        airflow users create
-          --username admin
-          --password admin
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@nutrition.local
-          2>/dev/null || echo 'Admin user already exists'
-      "
+    command: bash -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@nutrition.local || echo 'Admin user already exists'"
     restart: "no"
 
   airflow-webserver:

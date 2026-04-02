@@ -1,8 +1,12 @@
 import os
 import sys
+import shutil
 import logging
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, when, row_number, round, abs as spark_abs
+from pyspark.sql.functions import (
+    col, lit, when, row_number, round, abs as spark_abs,
+    datediff, current_date, floor as spark_floor,
+)
 from pyspark.sql.window import Window
 
 sys.path.insert(0, os.environ.get("PROJECT_ROOT", "/opt/project"))
@@ -32,6 +36,7 @@ gold_user_output = os.path.join(BASE_PATH, "gold", "user_profiles_enriched")
 spark = (
     SparkSession.builder
     .appName("silver-to-gold-recommendations")
+    .config("spark.hadoop.fs.permissions.umask-mode", "000")
     .getOrCreate()
 )
 
@@ -58,6 +63,16 @@ users = (
          .withColumn("current_weight_lb", col("current_weight_lb").cast("double"))
          .withColumn("target_weight_lb",  col("target_weight_lb").cast("double"))
 )
+
+# Derive age in whole years from birth_date if the column is present.
+# floor(datediff / 365.25) handles leap years correctly.
+if "birth_date" in users.columns:
+    users = users.withColumn(
+        "birth_date", col("birth_date").cast("date")
+    ).withColumn(
+        "age",
+        spark_floor(datediff(current_date(), col("birth_date")) / lit(365.25)).cast("integer"),
+    )
 
 users = users.withColumn(
     "goal_type",
@@ -141,6 +156,8 @@ run_checks([
     check_unique(top_recommendations, ["user_id", "food_name"], label="gold_recs"),
 ], stage="gold_recommendations_check")
 
+shutil.rmtree(gold_user_output, ignore_errors=True)
+shutil.rmtree(gold_output, ignore_errors=True)
 users.write.mode("overwrite").parquet(gold_user_output)
 top_recommendations.write.mode("overwrite").parquet(gold_output)
 

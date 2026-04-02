@@ -64,10 +64,19 @@ dim_food = food_df[[c for c in dim_food_cols if c in food_df.columns]].copy()
 # New user fields (user_name, gender, birth_date, age) are optional in the
 # batch parquet because user_profiles.csv predates the richer schema.
 # We include them if present; otherwise they default to NULL in Postgres.
-dim_user_base_cols = ["user_id", "height_cm", "current_weight_lb", "target_weight_lb", "goal_type"]
+dim_user_base_cols  = ["user_id", "height_cm", "current_weight_lb", "target_weight_lb", "goal_type"]
 dim_user_extra_cols = ["user_name", "gender", "birth_date", "age"]
 dim_user_select = dim_user_base_cols + [c for c in dim_user_extra_cols if c in user_df.columns]
 dim_user = user_df[dim_user_select].copy()
+
+# Inject SCD Type 2 fields for the initial batch load.
+# The batch pipeline always represents version 1 (the baseline snapshot).
+# Subsequent updates via the API / Kafka consumer will create version 2, 3, …
+import pandas as _pd
+dim_user["effective_start"] = _pd.Timestamp.utcnow().replace(tzinfo=None)
+dim_user["effective_end"]   = None
+dim_user["is_current"]      = True
+dim_user["version_number"]  = 1
 
 fact_rec_cols = [
     "user_id", "food_name", "goal_type",
