@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nutrition Recommendation Platform</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- ── Header ─────────────────────────────────────────────── -->
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">⚡</span>
+        <div>
+          <div class="logo-title">Nutrition Platform</div>
+          <div class="logo-sub">Personalised Food Recommendations · AWS Data Engineering</div>
+        </div>
+      </div>
+      <div id="api-status" class="api-badge checking">Connecting…</div>
+    </div>
+  </header>
+
+  <!-- ── Navigation ─────────────────────────────────────────── -->
+  <nav>
+    <div class="nav-inner">
+      <button class="nav-btn active" data-tab="create">Create User</button>
+      <button class="nav-btn" data-tab="lookup">Look Up User</button>
+      <button class="nav-btn" data-tab="history">Progress History</button>
+    </div>
+  </nav>
+
+  <!-- ── Main ───────────────────────────────────────────────── -->
+  <main>
+
+    <!-- ── TAB: Create User ─────────────────────────────────── -->
+    <section id="tab-create" class="tab active">
+      <div class="two-col">
+
+        <!-- Form -->
+        <div class="card">
+          <h2>Register New User</h2>
+          <p class="card-sub">Enter your profile details to receive personalised food recommendations.</p>
+          <form id="create-form" autocomplete="off">
+            <div class="field-row">
+              <div class="field">
+                <label>Full Name</label>
+                <input type="text" id="c-name" placeholder="e.g. James Carter" required />
+              </div>
+              <div class="field">
+                <label>Gender</label>
+                <select id="c-gender" required>
+                  <option value="">Select…</option>
+                  <option value="male">Male</option>
+                  <option value="female">Female</option>
+                  <option value="other">Other</option>
+                  <option value="prefer_not_to_say">Prefer not to say</option>
+                </select>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>Date of Birth</label>
+                <input type="date" id="c-dob" required />
+              </div>
+              <div class="field">
+                <label>Height (cm)</label>
+                <input type="number" id="c-height" placeholder="e.g. 175" min="1" max="300" step="0.1" required />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>Current Weight (lb)</label>
+                <input type="number" id="c-current-wt" placeholder="e.g. 210" min="1" max="800" step="0.1" required />
+              </div>
+              <div class="field">
+                <label>Target Weight (lb)</label>
+                <input type="number" id="c-target-wt" placeholder="e.g. 185" min="1" max="800" step="0.1" required />
+              </div>
+            </div>
+            <div id="create-goal-preview" class="goal-preview hidden"></div>
+            <button type="submit" class="btn-primary" id="create-btn">
+              <span class="btn-text">Get My Recommendations</span>
+              <span class="btn-spinner hidden">●</span>
+            </button>
+            <div id="create-error" class="error-msg hidden"></div>
+          </form>
+        </div>
+
+        <!-- Results -->
+        <div id="create-results" class="card hidden">
+          <div class="result-header">
+            <div>
+              <div class="user-id-badge" id="create-user-id"></div>
+              <h2 id="create-user-name"></h2>
+              <div class="meta-row">
+                <span id="create-goal-badge" class="goal-badge"></span>
+                <span id="create-meta"></span>
+              </div>
+            </div>
+          </div>
+          <h3>Your Top 10 Recommendations</h3>
+          <div id="create-recs" class="rec-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ── TAB: Look Up User ────────────────────────────────── -->
+    <section id="tab-lookup" class="tab">
+      <div class="search-bar card">
+        <h2>Look Up User</h2>
+        <p class="card-sub">Search by name or User ID — or browse all registered users below.</p>
+        <div class="search-row">
+          <div class="user-combo-wrapper" id="user-combo-wrapper">
+            <input type="text" id="lookup-id" placeholder="Name or User ID (e.g. U001 or 'James')" autocomplete="off" />
+            <div class="user-dropdown hidden" id="user-dropdown" role="listbox" aria-label="Matching users"></div>
+          </div>
+          <button class="btn-primary" id="lookup-btn">Search</button>
+        </div>
+        <div id="lookup-error" class="error-msg hidden"></div>
+      </div>
+
+      <div id="lookup-results" class="two-col hidden">
+
+        <!-- Profile card -->
+        <div class="card">
+          <div class="result-header">
+            <div>
+              <div class="user-id-badge" id="lu-user-id"></div>
+              <h2 id="lu-name"></h2>
+              <div class="meta-row">
+                <span id="lu-goal-badge" class="goal-badge"></span>
+                <span id="lu-meta"></span>
+              </div>
+            </div>
+            <div class="action-btns">
+              <button class="btn-secondary" id="edit-toggle-btn">Edit Profile</button>
+              <button class="btn-danger" id="delete-btn">Delete</button>
+            </div>
+          </div>
+
+          <div class="stats-grid" id="lu-stats"></div>
+
+          <!-- Edit form (hidden by default) -->
+          <div id="edit-form-wrapper" class="hidden">
+            <hr />
+            <h3>Update Profile</h3>
+            <p class="card-sub">Only fill in the fields you want to change.</p>
+            <form id="edit-form" autocomplete="off">
+              <div class="field-row">
+                <div class="field">
+                  <label>Full Name</label>
+                  <input type="text" id="e-name" placeholder="Leave blank to keep current" />
+                </div>
+                <div class="field">
+                  <label>Gender</label>
+                  <select id="e-gender">
+                    <option value="">Keep current</option>
+                    <option value="male">Male</option>
+                    <option value="female">Female</option>
+                    <option value="other">Other</option>
+                    <option value="prefer_not_to_say">Prefer not to say</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label>Current Weight (lb)</label>
+                  <input type="number" id="e-current-wt" placeholder="Leave blank to keep" min="1" max="800" step="0.1" />
+                </div>
+                <div class="field">
+                  <label>Target Weight (lb)</label>
+                  <input type="number" id="e-target-wt" placeholder="Leave blank to keep" min="1" max="800" step="0.1" />
+                </div>
+              </div>
+              <button type="submit" class="btn-primary">Save Changes</button>
+              <div id="edit-error" class="error-msg hidden"></div>
+              <div id="edit-success" class="success-msg hidden"></div>
+            </form>
+          </div>
+        </div>
+
+        <!-- Recommendations -->
+        <div class="card">
+          <h3>Current Recommendations</h3>
+          <div id="lu-recs" class="rec-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ── TAB: Progress History ────────────────────────────── -->
+    <section id="tab-history" class="tab">
+      <div class="search-bar card">
+        <h2>Progress History</h2>
+        <p class="card-sub">View the full SCD Type 2 version timeline for any user.</p>
+        <div class="search-row">
+          <input type="text" id="history-id" placeholder="Enter User ID (e.g. U004)" />
+          <button class="btn-primary" id="history-btn">Load History</button>
+        </div>
+        <div id="history-error" class="error-msg hidden"></div>
+      </div>
+
+      <div id="history-results" class="hidden">
+
+        <!-- Chart -->
+        <div class="card">
+          <h3 id="history-chart-title"></h3>
+          <div class="chart-wrapper">
+            <canvas id="progress-chart"></canvas>
+          </div>
+        </div>
+
+        <!-- Version table -->
+        <div class="card">
+          <h3>Version History</h3>
+          <div class="table-wrapper">
+            <table id="history-table">
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>Date</th>
+                  <th>Weight (lb)</th>
+                  <th>Target (lb)</th>
+                  <th>Gap (lb)</th>
+                  <th>Goal</th>
+                  <th>Progress</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="history-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div>Nutrition Data Platform &mdash; AWS Data Engineering Portfolio</div>
+  </footer>
+
+  <!-- ── User ID toast ─────────────────────────────────────── -->
+  <div class="toast" id="id-toast" role="alert" aria-live="polite">
+    <button class="toast-close" id="toast-close-btn" aria-label="Close">&times;</button>
+    <div class="toast-title">Your User ID</div>
+    <div class="toast-id" id="toast-user-id"></div>
+    <div class="toast-body">Save this ID — use it on the <strong>Look Up User</strong> tab to retrieve your profile and recommendations.</div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

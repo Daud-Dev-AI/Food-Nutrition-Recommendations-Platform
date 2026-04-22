@@ -6,6 +6,7 @@ import threading
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import create_engine, text
@@ -36,6 +37,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Nutrition Recommendation API", lifespan=lifespan)
+
+# Allow requests from the S3/CloudFront frontend and local dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type"],
+)
 
 engine = create_engine(DATABASE_URL)
 
@@ -288,6 +297,21 @@ def update_user_profile(user_id: str, payload: UserProfileUpdateRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/users")
+def list_users():
+    """Return all current user profiles for the browse dropdown."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT user_id, user_name, goal_type
+                FROM dim_user_profile
+                WHERE is_current = TRUE
+                ORDER BY user_id
+            """)
+        ).mappings().all()
+    return {"users": [dict(r) for r in rows]}
+
+
 @app.get("/users/{user_id}")
 def get_user_profile(user_id: str):
     """Return the current (latest) version of a user's profile."""
@@ -320,11 +344,12 @@ def get_user_history(user_id: str):
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
-                SELECT user_id, user_name, gender, birth_date, age,
+                SELECT user_id, user_name, gender, age,
                        height_cm, current_weight_lb, target_weight_lb,
-                       goal_type, effective_start, effective_end,
-                       is_current, version_number
-                FROM dim_user_profile
+                       goal_type, weight_delta_lb,
+                       changed_at, effective_end,
+                       is_current, version_number, progress_status
+                FROM vw_user_progress_history
                 WHERE user_id = :uid
                 ORDER BY version_number ASC
             """),

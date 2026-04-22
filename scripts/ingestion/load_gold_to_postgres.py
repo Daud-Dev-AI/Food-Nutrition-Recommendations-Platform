@@ -84,28 +84,54 @@ fact_rec_cols = [
 ]
 fact_rec = rec_df[[c for c in fact_rec_cols if c in rec_df.columns]].copy()
 
-# ── Truncate and reload warehouse tables ───────────────────────
-logger.info("Truncating warehouse tables")
-with engine.begin() as conn:
-    conn.execute(text("TRUNCATE TABLE fact_food_recommendation RESTART IDENTITY;"))
-    conn.execute(text("TRUNCATE TABLE dim_food RESTART IDENTITY;"))
-    conn.execute(text("TRUNCATE TABLE dim_user_profile RESTART IDENTITY;"))
+# ── Determine which batch users are new (not yet in DB) ───────────
+# dim_user_profile is NOT truncated — API-created users and their SCD2
+# history are preserved. Only CSV users absent from the DB are inserted.
+with engine.connect() as conn:
+    existing_user_ids = {
+        row[0] for row in conn.execute(text("SELECT DISTINCT user_id FROM dim_user_profile"))
+    }
 
-dim_user.to_sql("dim_user_profile",        engine, if_exists="append", index=False)
-logger.info("Loaded dim_user_profile: %d rows", len(dim_user))
+new_users = dim_user[~dim_user["user_id"].isin(existing_user_ids)].copy()
+new_user_ids = set(new_users["user_id"])
+new_recs = fact_rec[fact_rec["user_id"].isin(new_user_ids)].copy()
+
+logger.info(
+    "dim_user_profile: %d already in DB (skipped), %d new from batch",
+    len(existing_user_ids), len(new_users),
+)
+
+# ── Reload dim_food (static, no API writes) ────────────────────
+logger.info("Truncating and reloading dim_food and fact_food_recommendation for new users")
+with engine.begin() as conn:
+    conn.execute(text("TRUNCATE TABLE dim_food RESTART IDENTITY;"))
+    if new_user_ids:
+        ids_literal = ", ".join(f"'{uid}'" for uid in new_user_ids)
+        conn.execute(text(
+            f"DELETE FROM fact_food_recommendation WHERE user_id IN ({ids_literal})"
+        ))
+
+if new_users.empty:
+    logger.info("No new users from batch — dim_user_profile unchanged")
+else:
+    new_users.to_sql("dim_user_profile", engine, if_exists="append", index=False)
+    logger.info("Loaded dim_user_profile: %d new rows", len(new_users))
 
 dim_food.to_sql("dim_food",                engine, if_exists="append", index=False)
 logger.info("Loaded dim_food: %d rows", len(dim_food))
 
-fact_rec.to_sql("fact_food_recommendation", engine, if_exists="append", index=False)
-logger.info("Loaded fact_food_recommendation: %d rows", len(fact_rec))
+if new_recs.empty:
+    logger.info("No new recommendations to load for batch users")
+else:
+    new_recs.to_sql("fact_food_recommendation", engine, if_exists="append", index=False)
+    logger.info("Loaded fact_food_recommendation: %d rows for new users", len(new_recs))
 
 # ── Stage: warehouse validation (after loading) ────────────────
+# min_rows checks against total DB count (includes pre-existing API users)
 run_checks([
     check_warehouse_row_count(engine, "dim_food",                min_rows=len(dim_food)),
-    check_warehouse_row_count(engine, "dim_user_profile",        min_rows=len(dim_user)),
-    check_warehouse_row_count(engine, "fact_food_recommendation", min_rows=len(fact_rec)),
-    check_warehouse_unique(engine, "dim_user_profile", "user_id"),
+    check_warehouse_row_count(engine, "dim_user_profile",        min_rows=len(new_users)),
+    check_warehouse_row_count(engine, "fact_food_recommendation", min_rows=len(new_recs)),
     check_warehouse_referential_integrity(
         engine,
         fact_table="fact_food_recommendation",
